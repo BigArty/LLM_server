@@ -7,16 +7,6 @@ from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
 
 path += [os.path.abspath(r"exllama")]
-
-import torch
-from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
-from exllama.alt_generator import ExLlamaAltGenerator
-from exllama.generator import ExLlamaGenerator
-from exllama.model import ExLlama, ExLlamaCache, ExLlamaConfig
-from exllama.tokenizer import ExLlamaTokenizer
-from format_context import ContextFormatter
-from huggingface_hub import scan_cache_dir
-from huggingface_hub import snapshot_download
 from transformers import (
     AutoConfig,
     GenerationConfig,
@@ -28,6 +18,14 @@ from transformers import (
     logging,
     pipeline,
 )
+from huggingface_hub import snapshot_download
+from huggingface_hub import scan_cache_dir
+from exllama.tokenizer import ExLlamaTokenizer
+from exllama.model import ExLlama, ExLlamaCache, ExLlamaConfig
+from exllama.generator import ExLlamaGenerator
+from exllama.alt_generator import ExLlamaAltGenerator
+from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
+import torch
 
 
 class ChatRequest(BaseModel):
@@ -73,14 +71,22 @@ class ModelTemplate(ABC):
 class Model(ModelTemplate):
     def make_prompt(self, messages, max_length=None):
         if "WizardCoder" in self.name:
-            main_format = "<s>{history:list}### Response:\n"
-            data_format = {
-                "history": "{history:condition_dict:role}",
-                "history:system": "{content}\n\n",
-                "history:user": "### Instruction:\n{content}\n\n",
-                "history:assistant": "### Response:\n{content}\n\n",
-            }
+            strings = ["<s>"]
+            for message in messages["history"]:
+                if message["role"] == "system":
+                    strings.append(message["content"]+"\n\n")
+                elif message["role"] == "user":
+                    strings.append("### Instruction:\n" +
+                                   message["content"]+"\n\n")
+                elif message["role"] == "assistant":
+                    strings.append("### Response:\n" +
+                                   message["content"]+"\n\n")
+            strings.append("### Response:\n")
+
+            return "".join(strings)
+
         elif "Phind" in self.name:
+            raise NotImplementedError()
             main_format = "<s>{history:list}### Assistant\n"
             data_format = {
                 "history": "{history:condition_dict:role}",
@@ -89,10 +95,12 @@ class Model(ModelTemplate):
                 "history:assistant": "### Assistant\n{content}\n\n",
             }
         elif "CodeLlama" in self.name:
+            raise NotImplementedError()
             B_INST, E_INST = "[INST]", "[/INST]"
             B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
 
-            SPECIAL_TAGS_DICT = {"B_INST": B_INST, "E_INST": E_INST, "B_SYS": B_SYS, "E_SYS": E_SYS}
+            SPECIAL_TAGS_DICT = {"B_INST": B_INST,
+                                 "E_INST": E_INST, "B_SYS": B_SYS, "E_SYS": E_SYS}
             main_format = "<s>[INST] {history:list}"
             data_format = {
                 "history": "{history:condition_dict:role} ",
@@ -102,6 +110,7 @@ class Model(ModelTemplate):
             }
             data_format.update(SPECIAL_TAGS_DICT)
         elif "MegaCoder" in self.name:
+            raise NotImplementedError()
             main_format = "{history:list}<|im_start|>assistant\n"
             data_format = {
                 "history": "{history:condition_dict:role}",
@@ -111,12 +120,6 @@ class Model(ModelTemplate):
             }
         else:
             raise ReferenceError("Unknown model prompt type")
-
-        fmt = ContextFormatter(data_format, length_func=self.get_len)
-        result = fmt.format(main_format, **messages)
-        if max_length is not None:
-            result = fmt.cut_to(max_length)
-        return result
 
     def get_len(self, string):
         if self.backend == "exllama":
@@ -190,7 +193,8 @@ class Model(ModelTemplate):
                 )
                 et = time.time()
             generation_time = et - st
-            output = self.tokenizer.decode(output_tokens[0][batch["input_ids"].shape[-1]:], skip_special_tokens=True)
+            output = self.tokenizer.decode(
+                output_tokens[0][batch["input_ids"].shape[-1]:], skip_special_tokens=True)
             return output, generation_time
 
     def generate_beam(self,
@@ -263,7 +267,7 @@ class Model(ModelTemplate):
                 print("Cutting: ", self.generator_beam.gen_num_tokens(), end='')
                 self.generator_beam.gen_begin(
                     self.generator_beam.sequence_actual[:,
-                    -(self.config.max_seq_len - min_expected_complition - beam_length):]
+                                                        -(self.config.max_seq_len - min_expected_complition - beam_length):]
                 )
                 print(". After: ", self.generator_beam.gen_num_tokens())
                 self.generator_beam.begin_beam_search()
@@ -274,7 +278,8 @@ class Model(ModelTemplate):
             # Decode the current line and print any characters added
 
             num_res_tokens += 1
-            text = self.tokenizer.decode(self.generator_beam.sequence_actual[:, -num_res_tokens:][0], )
+            text = self.tokenizer.decode(
+                self.generator_beam.sequence_actual[:, -num_res_tokens:][0], )
             # new_text = text[len(res_line):]
             # print(new_text, end="")  # (character streaming output is here)
 
@@ -315,18 +320,23 @@ class Model(ModelTemplate):
 
             # Create config, model, tokenizer and generator
 
-            self.config = ExLlamaConfig(model_config_path)  # create config from config.json
+            # create config from config.json
+            self.config = ExLlamaConfig(model_config_path)
             self.config.model_path = model_path  # supply path to model weights file
             # if "WizardCoder" in model_name:
             self.config.max_seq_len = 4096
 
-            self.model = ExLlama(self.config)  # create ExLlama instance and load the weights
-            self.tokenizer = ExLlamaTokenizer(tokenizer_path)  # create tokenizer from tokenizer model file
+            # create ExLlama instance and load the weights
+            self.model = ExLlama(self.config)
+            # create tokenizer from tokenizer model file
+            self.tokenizer = ExLlamaTokenizer(tokenizer_path)
 
             self.cache = ExLlamaCache(self.model)  # create cache for inference
-            self.generator = ExLlamaAltGenerator(self.model, self.tokenizer, self.cache)  # create generator
+            self.generator = ExLlamaAltGenerator(
+                self.model, self.tokenizer, self.cache)  # create generator
 
-            self.generator_beam = ExLlamaGenerator(self.model, self.tokenizer, self.cache)
+            self.generator_beam = ExLlamaGenerator(
+                self.model, self.tokenizer, self.cache)
             self.generator_beam.settings = ExLlamaGenerator.Settings()
             self.generator_beam.settings.token_repetition_penalty_max = 1
             self.generator_beam.settings.token_repetition_penalty_sustain = 256
@@ -338,7 +348,8 @@ class Model(ModelTemplate):
 
             use_triton = False
 
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name_or_path, use_fast=True)
             self.config = GenerationConfig.from_pretrained(model_name_or_path, do_sample=True,
                                                            max_new_tokens=1500,
                                                            num_beams=1,
@@ -416,7 +427,7 @@ class Model(ModelTemplate):
 
         print(
             f"{generation_time:.2f} seconds\nPrompt: {self.get_len(prompt)}, output: {self.get_len(output)}\n======================")
-        print(prompt,'\n\n\n')
+        print(prompt, '\n\n\n')
         return output, self.get_len(prompt), self.get_len(output)
 
 
@@ -470,7 +481,7 @@ class Server:
             #         history.append(message)
             #         syst = True
             # messages["history"] = history
-            temperature = 0.5 # data.get("temperature", 0) + 0.01
+            temperature = 0.5  # data.get("temperature", 0) + 0.01
             top_p = 0.5  # data.get("top_p", 1)
             number_of_answers = data.get("n", 1)
             max_tokens = data.get("max_tokens", 1536)
@@ -506,25 +517,25 @@ class Server:
             raise HTTPException(status_code=400, detail="Invalid request data")
 
     async def generate(self, data: dict):
-            try:
-                messages = data['generate']
-                temperature = data.get("temperature", 0.1)
-                top_p = data.get("top_p", 0.9)
-                max_tokens = data.get("max_tokens", 1536)
-                response, timer = self.model.generate(
-                    messages, max_tokens, temperature=temperature, top_p=top_p, typical=0, top_k=50,
-                    # beams=5,
-                    # beam_length=10,
-                )
+        try:
+            messages = data['generate']
+            temperature = data.get("temperature", 0.1)
+            top_p = data.get("top_p", 0.9)
+            max_tokens = data.get("max_tokens", 1536)
+            response, timer = self.model.generate(
+                messages, max_tokens, temperature=temperature, top_p=top_p, typical=0, top_k=50,
+                # beams=5,
+                # beam_length=10,
+            )
 
-                chat_response = {
-                    "content": response,
-                }
-                return chat_response
+            chat_response = {
+                "content": response,
+            }
+            return chat_response
 
-            except HTTPException:
-                print(data)
-                raise HTTPException(status_code=400, detail="Invalid request data")
+        except HTTPException:
+            print(data)
+            raise HTTPException(status_code=400, detail="Invalid request data")
 
     def run(self):
         import uvicorn
